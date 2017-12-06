@@ -384,7 +384,7 @@ static ssize_t ramoops_pstore_read(u64 *id, enum pstore_type_id *type,
 	/* ECC correction notice */
 	ecc_notice_size = persistent_ram_ecc_string(prz, NULL, 0);
 
-	*buf = kmalloc(size + ecc_notice_size + 1, GFP_KERNEL);
+	*buf = vmalloc(size + ecc_notice_size + 1);
 	if (*buf == NULL)
 		return -ENOMEM;
 
@@ -666,7 +666,7 @@ static int ramoops_init_przs(struct device *dev, struct ramoops_context *cxt,
 		cxt->przs[i] = persistent_ram_new(*paddr, *alt_paddr,
 						  cxt->record_size, 0,
 						  &cxt->ecc_info,
-						  cxt->memtype);
+						  cxt->memtype, 0);
 		if (IS_ERR(cxt->przs[i])) {
 			err = PTR_ERR(cxt->przs[i]);
 			dev_err(dev, "failed to request mem region (0x%zx@0x%llx): %d\n",
@@ -707,7 +707,7 @@ static int ramoops_init_prz(struct device *dev, struct ramoops_context *cxt,
 	}
 
 	*prz = persistent_ram_new(*paddr, *alt_paddr, sz, sig, &cxt->ecc_info,
-				  cxt->memtype);
+				  cxt->memtype, 0);
 	if (IS_ERR(*prz)) {
 		int err = PTR_ERR(*prz);
 

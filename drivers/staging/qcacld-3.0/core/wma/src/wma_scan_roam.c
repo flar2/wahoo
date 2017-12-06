@@ -97,6 +97,12 @@ enum extscan_report_events_type {
 };
 
 #define WMA_EXTSCAN_CYCLE_WAKE_LOCK_DURATION (5 * 1000) /* in msec */
+
+/*
+ * Maximum number of entires that could be present in the
+ * WMI_EXTSCAN_HOTLIST_MATCH_EVENT buffer from the firmware
+ */
+#define WMA_EXTSCAN_MAX_HOTLIST_ENTRIES 10
 #endif
 
 /**
@@ -707,9 +713,12 @@ QDF_STATUS wma_update_channel_list(WMA_HANDLE handle,
 			 chan_list->chanParam[i].dfsSet,
 			 chan_list->chanParam[i].pwr);
 
-		if (chan_list->chanParam[i].dfsSet)
+		if (chan_list->chanParam[i].dfsSet) {
 			WMI_SET_CHANNEL_FLAG(tchan_info,
 					     WMI_CHAN_FLAG_PASSIVE);
+			WMI_SET_CHANNEL_FLAG(tchan_info,
+					     WMI_CHAN_FLAG_DFS);
+		}
 
 		if (tchan_info->mhz < WMA_2_4_GHZ_MAX_FREQ) {
 			WMI_SET_CHANNEL_MODE(tchan_info, MODE_11G);
@@ -885,6 +894,10 @@ QDF_STATUS wma_roam_scan_offload_rssi_thresh(tp_wma_handle wma_handle,
 	params.bg_scan_bad_rssi_thresh = roam_params->bg_scan_bad_rssi_thresh -
 		WMA_NOISE_FLOOR_DBM_DEFAULT;
 	params.bg_scan_client_bitmap = roam_params->bg_scan_client_bitmap;
+	params.roam_bad_rssi_thresh_offset_2g =
+				roam_params->roam_bad_rssi_thresh_offset_2g;
+	if (params.roam_bad_rssi_thresh_offset_2g)
+		params.flags |= WMI_ROAM_BG_SCAN_FLAGS_2G_TO_5G_ONLY;
 
 	/*
 	 * The current Noise floor in firmware is -96dBm. Penalty/Boost
@@ -931,11 +944,14 @@ QDF_STATUS wma_roam_scan_offload_rssi_thresh(tp_wma_handle wma_handle,
 		params.roam_earlystop_thres_min = 0;
 		params.roam_earlystop_thres_max = 0;
 	}
+	params.rssi_thresh_offset_5g =
+		roam_req->rssi_thresh_offset_5g;
 
 	WMA_LOGD("early_stop_thresholds en=%d, min=%d, max=%d",
 		roam_req->early_stop_scan_enable,
 		params.roam_earlystop_thres_min,
 		params.roam_earlystop_thres_max);
+	WMA_LOGD("rssi_thresh_offset_5g = %d", params.rssi_thresh_offset_5g);
 
 	status = wmi_unified_roam_scan_offload_rssi_thresh_cmd(
 			wma_handle->wmi_handle, &params);
@@ -955,9 +971,10 @@ QDF_STATUS wma_roam_scan_offload_rssi_thresh(tp_wma_handle wma_handle,
 			roam_params->dense_min_aps_cnt,
 			roam_params->traffic_threshold,
 			roam_params->initial_dense_status);
-	WMA_LOGD(FL("BG Scan Bad RSSI:%d, bitmap:0x%x"),
+	WMA_LOGD(FL("BG Scan Bad RSSI:%d, bitmap:0x%x Offset for 2G to 5G Roam:%d"),
 			roam_params->bg_scan_bad_rssi_thresh,
-			roam_params->bg_scan_client_bitmap);
+			roam_params->bg_scan_client_bitmap,
+			roam_params->roam_bad_rssi_thresh_offset_2g);
 	return status;
 }
 
@@ -1182,60 +1199,56 @@ static uint32_t wma_roam_scan_get_cckm_mode(tSirRoamOffloadScanReq *roam_req,
 #endif
 /**
  * wma_roam_scan_fill_ap_profile() - fill ap_profile
- * @wma_handle: wma handle
- * @pMac: Mac ptr
  * @roam_req: roam offload scan request
- * @ap_profile_p: ap profile
+ * @profile: ap profile
  *
  * Fill ap_profile structure from configured parameters
  *
  * Return: none
  */
-void wma_roam_scan_fill_ap_profile(tp_wma_handle wma_handle,
-				   tpAniSirGlobal pMac,
-				   tSirRoamOffloadScanReq *roam_req,
-				   wmi_ap_profile *ap_profile_p)
+static void wma_roam_scan_fill_ap_profile(tSirRoamOffloadScanReq *roam_req,
+				   struct ap_profile *profile)
 {
 	uint32_t rsn_authmode;
 
-	qdf_mem_zero(ap_profile_p, sizeof(wmi_ap_profile));
+	qdf_mem_zero(profile, sizeof(*profile));
 	if (roam_req == NULL) {
-		ap_profile_p->ssid.ssid_len = 0;
-		ap_profile_p->ssid.ssid[0] = 0;
-		ap_profile_p->rsn_authmode = WMI_AUTH_NONE;
-		ap_profile_p->rsn_ucastcipherset = WMI_CIPHER_NONE;
-		ap_profile_p->rsn_mcastcipherset = WMI_CIPHER_NONE;
-		ap_profile_p->rsn_mcastmgmtcipherset = WMI_CIPHER_NONE;
-		ap_profile_p->rssi_threshold = WMA_ROAM_RSSI_DIFF_DEFAULT;
+		profile->ssid.length = 0;
+		profile->ssid.mac_ssid[0] = 0;
+		profile->rsn_authmode = WMI_AUTH_NONE;
+		profile->rsn_ucastcipherset = WMI_CIPHER_NONE;
+		profile->rsn_mcastcipherset = WMI_CIPHER_NONE;
+		profile->rsn_mcastmgmtcipherset = WMI_CIPHER_NONE;
+		profile->rssi_threshold = WMA_ROAM_RSSI_DIFF_DEFAULT;
 	} else {
-		ap_profile_p->ssid.ssid_len =
+		profile->ssid.length =
 			roam_req->ConnectedNetwork.ssId.length;
-		qdf_mem_copy(ap_profile_p->ssid.ssid,
+		qdf_mem_copy(profile->ssid.mac_ssid,
 			     roam_req->ConnectedNetwork.ssId.ssId,
-			     ap_profile_p->ssid.ssid_len);
-		ap_profile_p->rsn_authmode =
+			     profile->ssid.length);
+		profile->rsn_authmode =
 			e_csr_auth_type_to_rsn_authmode(
 				roam_req->ConnectedNetwork.authentication,
 				roam_req->ConnectedNetwork.encryption);
-		rsn_authmode = ap_profile_p->rsn_authmode;
+		rsn_authmode = profile->rsn_authmode;
 
 		if ((rsn_authmode == WMI_AUTH_CCKM_WPA) ||
 			(rsn_authmode == WMI_AUTH_CCKM_RSNA))
-			ap_profile_p->rsn_authmode =
+			profile->rsn_authmode =
 				wma_roam_scan_get_cckm_mode(
 						roam_req, rsn_authmode);
-		ap_profile_p->rsn_ucastcipherset =
+		profile->rsn_ucastcipherset =
 			e_csr_encryption_type_to_rsn_cipherset(
 					roam_req->ConnectedNetwork.encryption);
-		ap_profile_p->rsn_mcastcipherset =
+		profile->rsn_mcastcipherset =
 			e_csr_encryption_type_to_rsn_cipherset(
 				roam_req->ConnectedNetwork.mcencryption);
-		ap_profile_p->rsn_mcastmgmtcipherset =
-			ap_profile_p->rsn_mcastcipherset;
-		ap_profile_p->rssi_threshold = roam_req->RoamRssiDiff;
+		profile->rsn_mcastmgmtcipherset =
+			profile->rsn_mcastcipherset;
+		profile->rssi_threshold = roam_req->RoamRssiDiff;
 #ifdef WLAN_FEATURE_11W
 		if (roam_req->ConnectedNetwork.mfp_enabled)
-			ap_profile_p->flags |= WMI_AP_PROFILE_FLAG_PMF;
+			profile->flags |= WMI_AP_PROFILE_FLAG_PMF;
 #endif
 	}
 }
@@ -1553,19 +1566,23 @@ void wma_roam_scan_fill_scan_params(tp_wma_handle wma_handle,
 /**
  * wma_roam_scan_offload_ap_profile() - set roam ap profile in fw
  * @wma_handle: wma handle
- * @ap_profile_p: ap profile
- * @vdev_id: vdev id
+ * @mac_ctx: Mac ptr
+ * @roam_req: Request which contains the ap profile
  *
  * Send WMI_ROAM_AP_PROFILE to firmware
  *
  * Return: QDF status
  */
-QDF_STATUS wma_roam_scan_offload_ap_profile(tp_wma_handle wma_handle,
-					    wmi_ap_profile *ap_profile_p,
-					    uint32_t vdev_id)
+static QDF_STATUS wma_roam_scan_offload_ap_profile(tp_wma_handle wma_handle,
+					    tSirRoamOffloadScanReq *roam_req)
 {
+	struct ap_profile_params ap_profile;
+
+	ap_profile.vdev_id = roam_req->sessionId;
+	wma_roam_scan_fill_ap_profile(roam_req, &ap_profile.profile);
+	ap_profile.param = roam_req->score_params;
 	return wmi_unified_send_roam_scan_offload_ap_cmd(wma_handle->wmi_handle,
-			  ap_profile_p, vdev_id);
+							 &ap_profile);
 }
 
 /**
@@ -1585,7 +1602,7 @@ static QDF_STATUS wma_roam_scan_filter(tp_wma_handle wma_handle,
 {
 	int i;
 	QDF_STATUS status = QDF_STATUS_SUCCESS;
-	uint32_t len = 0, num_bssid_black_list = 0, num_ssid_white_list = 0,
+	uint32_t num_bssid_black_list = 0, num_ssid_white_list = 0,
 	   num_bssid_preferred_list = 0;
 	uint32_t op_bitmap = 0;
 	struct roam_ext_params *roam_params;
@@ -1606,30 +1623,20 @@ static QDF_STATUS wma_roam_scan_filter(tp_wma_handle wma_handle,
 			op_bitmap |= 0x1;
 			num_bssid_black_list =
 				roam_params->num_bssid_avoid_list;
-			len = num_bssid_black_list * sizeof(wmi_mac_addr);
-			len += WMI_TLV_HDR_SIZE;
 			break;
 		case REASON_ROAM_SET_SSID_ALLOWED:
 			op_bitmap |= 0x2;
 			num_ssid_white_list =
 				roam_params->num_ssid_allowed_list;
-			len = num_ssid_white_list * sizeof(wmi_ssid);
-			len += WMI_TLV_HDR_SIZE;
 			break;
 		case REASON_ROAM_SET_FAVORED_BSSID:
 			op_bitmap |= 0x4;
 			num_bssid_preferred_list =
 				roam_params->num_bssid_favored;
-			len = num_bssid_preferred_list * sizeof(wmi_mac_addr);
-			len += WMI_TLV_HDR_SIZE;
-			len += num_bssid_preferred_list * sizeof(A_UINT32);
 			break;
 		case REASON_CTX_INIT:
 			if (roam_req->Command == ROAM_SCAN_OFFLOAD_START) {
 				params->lca_disallow_config_present = true;
-				len += sizeof(
-					wmi_roam_lca_disallow_config_tlv_param)
-					+ (4 * WMI_TLV_HDR_SIZE);
 				op_bitmap |= ROAM_FILTER_OP_BITMAP_LCA_DISALLOW;
 			} else {
 				WMA_LOGD("%s : Roam Filter need not be sent", __func__);
@@ -1649,11 +1656,7 @@ static QDF_STATUS wma_roam_scan_filter(tp_wma_handle wma_handle,
 		 */
 		op_bitmap = 0x2 | 0x4;
 		num_ssid_white_list = roam_params->num_ssid_allowed_list;
-		len = num_ssid_white_list * sizeof(wmi_ssid);
 		num_bssid_preferred_list = roam_params->num_bssid_favored;
-		len += num_bssid_preferred_list * sizeof(wmi_mac_addr);
-		len += num_bssid_preferred_list * sizeof(A_UINT32);
-		len += (2 * WMI_TLV_HDR_SIZE);
 	}
 
 	/* fill in fixed values */
@@ -1662,7 +1665,6 @@ static QDF_STATUS wma_roam_scan_filter(tp_wma_handle wma_handle,
 	params->num_bssid_black_list = num_bssid_black_list;
 	params->num_ssid_white_list = num_ssid_white_list;
 	params->num_bssid_preferred_list = num_bssid_preferred_list;
-	params->len = len;
 	qdf_mem_copy(params->bssid_avoid_list, roam_params->bssid_avoid_list,
 			MAX_BSSID_AVOID_LIST * sizeof(struct qdf_mac_addr));
 
@@ -1770,7 +1772,6 @@ QDF_STATUS wma_process_roaming_config(tp_wma_handle wma_handle,
 {
 	QDF_STATUS qdf_status = QDF_STATUS_SUCCESS;
 	wmi_start_scan_cmd_fixed_param scan_params;
-	wmi_ap_profile ap_profile;
 	tpAniSirGlobal pMac = cds_get_context(QDF_MODULE_ID_PE);
 	uint32_t mode = 0;
 	struct wma_txrx_node *intr = NULL;
@@ -1855,11 +1856,8 @@ QDF_STATUS wma_process_roaming_config(tp_wma_handle wma_handle,
 		if (qdf_status != QDF_STATUS_SUCCESS)
 			break;
 
-		wma_roam_scan_fill_ap_profile(wma_handle, pMac, roam_req,
-					      &ap_profile);
-
 		qdf_status = wma_roam_scan_offload_ap_profile(wma_handle,
-					      &ap_profile, roam_req->sessionId);
+							      roam_req);
 		if (qdf_status != QDF_STATUS_SUCCESS)
 			break;
 
@@ -2085,10 +2083,8 @@ QDF_STATUS wma_process_roaming_config(tp_wma_handle wma_handle,
 		if (qdf_status != QDF_STATUS_SUCCESS)
 			break;
 
-		wma_roam_scan_fill_ap_profile(wma_handle, pMac, roam_req,
-					      &ap_profile);
 		qdf_status = wma_roam_scan_offload_ap_profile(wma_handle,
-					&ap_profile, roam_req->sessionId);
+							      roam_req);
 		if (qdf_status != QDF_STATUS_SUCCESS)
 			break;
 
@@ -2447,6 +2443,23 @@ int wma_roam_synch_event_handler(void *handle, uint8_t *event,
 		goto cleanup_label;
 	}
 	WMA_LOGI("LFR3: Received WMA_ROAM_OFFLOAD_SYNCH_IND");
+
+	/*
+	 * All below length fields are unsigned and hence positive numbers.
+	 * Maximum number during the addition would be (3 * MAX_LIMIT(UINT32) +
+	 * few fixed fields).
+	 */
+	if (sizeof(*synch_event) + synch_event->bcn_probe_rsp_len +
+			synch_event->reassoc_rsp_len +
+			synch_event->reassoc_req_len +
+			sizeof(wmi_channel) + sizeof(wmi_key_material) +
+			sizeof(uint32_t) > WMI_SVC_MSG_MAX_SIZE) {
+		WMA_LOGE("excess synch payload: LEN bcn:%d, req:%d, rsp:%d",
+				synch_event->bcn_probe_rsp_len,
+				synch_event->reassoc_req_len,
+				synch_event->reassoc_rsp_len);
+		goto cleanup_label;
+	}
 
 	cds_host_diag_log_work(&wma->roam_ho_wl,
 			       WMA_ROAM_HO_WAKE_LOCK_DURATION,
@@ -3161,7 +3174,8 @@ send_resp:
 	params->status = status;
 	WMA_LOGD("%s: sending WMA_SWITCH_CHANNEL_RSP, status = 0x%x",
 		 __func__, status);
-	wma_send_msg(wma, WMA_SWITCH_CHANNEL_RSP, (void *)params, 0);
+	wma_send_msg_high_priority(wma, WMA_SWITCH_CHANNEL_RSP,
+					(void *)params, 0);
 }
 
 #ifdef FEATURE_WLAN_SCAN_PNO
@@ -4190,7 +4204,8 @@ int wma_extscan_hotlist_match_event_handler(void *handle,
 	struct extscan_hotlist_match *dest_hotlist;
 	tSirWifiScanResult *dest_ap;
 	wmi_extscan_wlan_descriptor *src_hotlist;
-	int numap, j, ap_found = 0;
+	uint32_t numap;
+	int j, ap_found = 0;
 	tpAniSirGlobal pMac = cds_get_context(QDF_MODULE_ID_PE);
 
 	if (!pMac) {
@@ -4214,6 +4229,11 @@ int wma_extscan_hotlist_match_event_handler(void *handle,
 	if (!src_hotlist || !numap) {
 		WMA_LOGE("%s: Hotlist AP's list invalid", __func__);
 		return -EINVAL;
+	}
+	if (numap > WMA_EXTSCAN_MAX_HOTLIST_ENTRIES) {
+		WMA_LOGE("%s: Total Entries %u greater than max",
+			__func__, numap);
+		numap = WMA_EXTSCAN_MAX_HOTLIST_ENTRIES;
 	}
 	dest_hotlist = qdf_mem_malloc(sizeof(*dest_hotlist) +
 				      sizeof(*dest_ap) * numap);
@@ -4461,6 +4481,8 @@ int wma_extscan_cached_results_event_handler(void *handle,
 	wmi_extscan_rssi_info *src_rssi;
 	int numap, i, moredata, scan_ids_cnt, buf_len;
 	tpAniSirGlobal pMac = cds_get_context(QDF_MODULE_ID_PE);
+	uint32_t total_len;
+	bool excess_data = false;
 
 	if (!pMac) {
 		WMA_LOGE("%s: Invalid pMac", __func__);
@@ -4506,6 +4528,44 @@ int wma_extscan_cached_results_event_handler(void *handle,
 	WMA_LOGD("%s: scan_ids_cnt %d", __func__, scan_ids_cnt);
 	dest_cachelist->num_scan_ids = scan_ids_cnt;
 
+	if (event->num_entries_in_page >
+		(WMI_SVC_MSG_MAX_SIZE - sizeof(*event))/sizeof(*src_hotlist)) {
+		WMA_LOGE("%s:excess num_entries_in_page %d in WMI event",
+				__func__, event->num_entries_in_page);
+		qdf_mem_free(dest_cachelist);
+		QDF_ASSERT(0);
+		return -EINVAL;
+	} else {
+		total_len = sizeof(*event) +
+			(event->num_entries_in_page * sizeof(*src_hotlist));
+	}
+	for (i = 0; i < event->num_entries_in_page; i++) {
+		if (src_hotlist[i].ie_length > WMI_SVC_MSG_MAX_SIZE -
+			total_len) {
+			excess_data = true;
+			break;
+		} else {
+			total_len += src_hotlist[i].ie_length;
+			WMA_LOGD("total len IE: %d", total_len);
+		}
+
+		if (src_hotlist[i].number_rssi_samples >
+			(WMI_SVC_MSG_MAX_SIZE - total_len)/sizeof(*src_rssi)) {
+			excess_data = true;
+			break;
+		} else {
+			total_len += (src_hotlist[i].number_rssi_samples *
+					sizeof(*src_rssi));
+			WMA_LOGD("total len RSSI samples: %d", total_len);
+		}
+	}
+	if (excess_data) {
+		WMA_LOGE("%s:excess data in WMI event",
+				__func__);
+		qdf_mem_free(dest_cachelist);
+		QDF_ASSERT(0);
+		return -EINVAL;
+	}
 	buf_len = sizeof(*dest_result) * scan_ids_cnt;
 	dest_cachelist->result = qdf_mem_malloc(buf_len);
 	if (!dest_cachelist->result) {
@@ -4569,6 +4629,8 @@ int wma_extscan_change_results_event_handler(void *handle,
 	int moredata;
 	int rssi_num = 0;
 	tpAniSirGlobal pMac = cds_get_context(QDF_MODULE_ID_PE);
+	uint32_t buf_len;
+	bool excess_data = false;
 
 	if (!pMac) {
 		WMA_LOGE("%s: Invalid pMac", __func__);
@@ -4601,6 +4663,31 @@ int wma_extscan_change_results_event_handler(void *handle,
 		moredata = 1;
 	} else {
 		moredata = 0;
+	}
+
+	do {
+		if (event->num_entries_in_page >
+			(WMI_SVC_MSG_MAX_SIZE - sizeof(*event))/
+			sizeof(*src_chglist)) {
+			excess_data = true;
+			break;
+		} else {
+			buf_len =
+				sizeof(*event) + (event->num_entries_in_page *
+						sizeof(*src_chglist));
+		}
+		if (rssi_num >
+			(WMI_SVC_MSG_MAX_SIZE - buf_len)/sizeof(int32_t)) {
+			excess_data = true;
+			break;
+		}
+	} while (0);
+
+	if (excess_data) {
+		WMA_LOGE("buffer len exceeds WMI payload,numap:%d, rssi_num:%d",
+				numap, rssi_num);
+		QDF_ASSERT(0);
+		return -EINVAL;
 	}
 	dest_chglist = qdf_mem_malloc(sizeof(*dest_chglist) +
 				      sizeof(*dest_ap) * numap +
@@ -4675,6 +4762,18 @@ int wma_passpoint_match_event_handler(void *handle,
 	}
 	event = param_buf->fixed_param;
 	buf_ptr = (uint8_t *)param_buf->fixed_param;
+
+	/*
+	 * All the below lengths are UINT32 and summing up and checking
+	 * against a constant should not be an issue.
+	 */
+	if ((sizeof(*event) + event->ie_length + event->anqp_length) >
+			WMI_SVC_MSG_MAX_SIZE) {
+		WMA_LOGE("IE Length: %d or ANQP Length: %d is huge",
+				 event->ie_length, event->anqp_length);
+		QDF_ASSERT(0);
+		return -EINVAL;
+	}
 
 	dest_match = qdf_mem_malloc(sizeof(*dest_match) +
 				event->ie_length + event->anqp_length);

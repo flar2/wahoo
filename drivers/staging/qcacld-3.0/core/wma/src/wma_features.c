@@ -1642,6 +1642,12 @@ int wma_nan_rsp_event_handler(void *handle, uint8_t *event_buf,
 	buf_ptr = (uint8_t *) nan_rsp_event_hdr;
 	alloc_len = sizeof(tSirNanEvent);
 	alloc_len += nan_rsp_event_hdr->data_len;
+	if (nan_rsp_event_hdr->data_len > ((WMI_SVC_MSG_MAX_SIZE -
+	    sizeof(*nan_rsp_event_hdr)) / sizeof(uint8_t))) {
+		WMA_LOGE("excess data length:%d", nan_rsp_event_hdr->data_len);
+		QDF_ASSERT(0);
+		return -EINVAL;
+	}
 	nan_rsp_event = (tSirNanEvent *) qdf_mem_malloc(alloc_len);
 	if (NULL == nan_rsp_event) {
 		WMA_LOGE("%s: Memory allocation failure", __func__);
@@ -6104,7 +6110,7 @@ void wma_aggr_qos_req(tp_wma_handle wma,
 	wmi_unified_aggr_qos_cmd(wma->wmi_handle,
 			   (struct aggr_add_ts_param *)pAggrQosRspMsg);
 	/* send reponse to upper layers from here only. */
-	wma_send_msg(wma, WMA_AGGR_QOS_RSP, pAggrQosRspMsg, 0);
+	wma_send_msg_high_priority(wma, WMA_AGGR_QOS_RSP, pAggrQosRspMsg, 0);
 }
 
 #ifdef FEATURE_WLAN_ESE
@@ -6169,7 +6175,7 @@ void wma_add_ts_req(tp_wma_handle wma, tAddTsParams *msg)
 #endif /* WLAN_FEATURE_ROAM_OFFLOAD */
 
 	}
-	wma_send_msg(wma, WMA_ADD_TS_RSP, msg, 0);
+	wma_send_msg_high_priority(wma, WMA_ADD_TS_RSP, msg, 0);
 }
 
 /**
@@ -6379,6 +6385,24 @@ static QDF_STATUS wma_add_clear_mcbc_filter(tp_wma_handle wma_handle,
 }
 
 /**
+ * wma_multiple_add_clear_mcbc_filter() - send multiple mcast filter
+ *					  command to fw
+ * @wma_handle: wma handle
+ * @vdev_id: vdev id
+ * @mcast_filter_params: mcast fliter params
+ *
+ * Return: 0 for success or error code
+ */
+static QDF_STATUS wma_multiple_add_clear_mcbc_filter(tp_wma_handle wma_handle,
+				     uint8_t vdev_id,
+				     struct mcast_filter_params *filter_param)
+{
+	return wmi_unified_multiple_add_clear_mcbc_filter_cmd(
+				wma_handle->wmi_handle,
+				vdev_id, filter_param);
+}
+
+/**
  * wma_config_enhance_multicast_offload() - config enhance multicast offload
  * @wma_handle: wma handle
  * @vdev_id: vdev id
@@ -6435,7 +6459,6 @@ QDF_STATUS wma_process_mcbc_set_filter_req(tp_wma_handle wma_handle,
 					   tSirRcvFltMcAddrList *mcbc_param)
 {
 	uint8_t vdev_id = 0;
-	int i;
 
 	if (mcbc_param->ulMulticastAddrCnt <= 0) {
 		WMA_LOGW("Number of multicast addresses is 0");
@@ -6469,15 +6492,37 @@ QDF_STATUS wma_process_mcbc_set_filter_req(tp_wma_handle wma_handle,
 		__func__);
 	}
 
-	/* set mcbc_param->action to clear MCList and reset
-	 * to configure the MCList in FW
-	 */
+	if (WMI_SERVICE_IS_ENABLED(wma_handle->wmi_service_bitmap,
+		WMI_SERVICE_MULTIPLE_MCAST_FILTER_SET)) {
+		struct mcast_filter_params filter_params;
 
-	for (i = 0; i < mcbc_param->ulMulticastAddrCnt; i++) {
-		wma_add_clear_mcbc_filter(wma_handle, vdev_id,
-					  mcbc_param->multicastAddr[i],
-					  (mcbc_param->action == 0));
+		WMA_LOGD("%s: FW supports multiple mcast filter", __func__);
+
+		filter_params.multicast_addr_cnt =
+					mcbc_param->ulMulticastAddrCnt;
+		qdf_mem_copy(filter_params.multicast_addr,
+			     mcbc_param->multicastAddr,
+			     mcbc_param->ulMulticastAddrCnt * ATH_MAC_LEN);
+		filter_params.action = mcbc_param->action;
+
+		wma_multiple_add_clear_mcbc_filter(wma_handle, vdev_id,
+						   &filter_params);
+	} else {
+		int i;
+
+		WMA_LOGD("%s: FW does not support multiple mcast filter",
+			 __func__);
+		/*
+		 * set mcbc_param->action to clear MCList and reset
+		 * to configure the MCList in FW
+		 */
+
+		for (i = 0; i < mcbc_param->ulMulticastAddrCnt; i++)
+			wma_add_clear_mcbc_filter(wma_handle, vdev_id,
+						  mcbc_param->multicastAddr[i],
+						  (mcbc_param->action == 0));
 	}
+
 	return QDF_STATUS_SUCCESS;
 }
 

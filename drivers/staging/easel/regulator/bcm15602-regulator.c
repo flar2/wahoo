@@ -266,7 +266,7 @@ static struct regulator_init_data
 	},
 };
 
-static int bcm15602_toggle_pon(struct bcm15602_chip *ddata)
+int bcm15602_toggle_pon(struct bcm15602_chip *ddata)
 {
 	dev_err(ddata->dev, "%s: device is stuck, toggling PON\n", __func__);
 
@@ -275,6 +275,21 @@ static int bcm15602_toggle_pon(struct bcm15602_chip *ddata)
 
 	return 0;
 }
+EXPORT_SYMBOL(bcm15602_toggle_pon);
+
+int bcm15602_dump_regs(struct bcm15602_chip *ddata)
+{
+	u8 reg_data;
+	int i;
+
+	for (i = 0; i <= BCM15602_REG_WDT_WDTSTST; i++) {
+		bcm15602_read_byte(ddata, i, &reg_data);
+		dev_info(ddata->dev, "[0x%02x] = 0x%02x\n", i, reg_data);
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(bcm15602_dump_regs);
 
 static inline bool bcm15602_is_ready(struct bcm15602_chip *ddata)
 {
@@ -974,7 +989,7 @@ static int bcm15602_regulator_enable(struct regulator_dev *rdev)
 		break;
 	case BCM15602_ID_ASR:
 		ret = bcm15602_write_byte(ddata, BCM15602_REG_BUCK_ASR_CTRL0,
-					  0xC5);
+					  0xC1);
 		break;
 	case BCM15602_ID_SDSR:
 		ret = bcm15602_write_byte(ddata, BCM15602_REG_BUCK_SDSR_CTRL0,
@@ -1010,7 +1025,7 @@ static int bcm15602_regulator_disable(struct regulator_dev *rdev)
 		break;
 	case BCM15602_ID_ASR:
 		ret = bcm15602_write_byte(ddata, BCM15602_REG_BUCK_ASR_CTRL0,
-					  0xC4);
+					  0xC0);
 		break;
 	case BCM15602_ID_SDSR:
 		ret = bcm15602_write_byte(ddata, BCM15602_REG_BUCK_SDSR_CTRL0,
@@ -1167,8 +1182,7 @@ static int bcm15602_chip_fixup(struct bcm15602_chip *ddata)
 
 	if (ddata->rev_id < BCM15602_REV_A1) {
 		/* enable bandgap curvature correction for improved accuracy */
-		bcm15602_update_bits(ddata, BCM15602_REG_ADC_BGCTRL, 0x40,
-				     0x40);
+		bcm15602_write_byte(ddata, BCM15602_REG_ADC_BGCTRL, 0x7b);
 
 		/* unlock register, then set ASR switching frequency trim */
 		bcm15602_write_byte(ddata, BCM15602_REG_SYS_WRLOCKEY, 0x38);
@@ -1189,13 +1203,14 @@ static int bcm15602_chip_fixup(struct bcm15602_chip *ddata)
 		/* set ASR rail to 0.9V */
 		bcm15602_write_byte(ddata, BCM15602_REG_BUCK_ASR_VOCTRL, 0x43);
 
-		/* set ASR to single phase */
-		bcm15602_update_bits(ddata, BCM15602_REG_BUCK_ASR_TSET_CTRL2,
-				     0x10, 0x00);
+		/* disable zero-I detection */
+		bcm15602_write_byte(ddata, BCM15602_REG_BUCK_ASR_CTRL0, 0xC0);
 	} else if (ddata->rev_id == BCM15602_REV_A1) {
 		/* enable bandgap curvature correction for improved accuracy */
-		bcm15602_update_bits(ddata, BCM15602_REG_ADC_BGCTRL, 0x40,
-				     0x40);
+		bcm15602_write_byte(ddata, BCM15602_REG_ADC_BGCTRL, 0x7b);
+
+		/* disable zero-I detection */
+		bcm15602_write_byte(ddata, BCM15602_REG_BUCK_ASR_CTRL0, 0xC0);
 	}
 
 	return 0;
@@ -1233,6 +1248,7 @@ static int bcm15602_probe(struct i2c_client *client,
 
 	/* set client data */
 	i2c_set_clientdata(client, ddata);
+	dev_set_drvdata(dev, ddata);
 
 	/* get platform data */
 	pdata = dev_get_platdata(dev);
@@ -1263,9 +1279,6 @@ static int bcm15602_probe(struct i2c_client *client,
 			__func__, ret);
 		return -ENOMEM;
 	}
-
-	/* create sysfs attributes */
-	bcm15602_config_sysfs(dev);
 
 	/* request GPIOs and IRQs */
 	devm_gpio_request_one(dev, pdata->pon_gpio, GPIOF_OUT_INIT_LOW,
@@ -1318,6 +1331,9 @@ static int bcm15602_probe(struct i2c_client *client,
 		goto error_reset;
 	}
 
+	/* create sysfs attributes */
+	bcm15602_config_sysfs(dev);
+
 	/* enable the irq after power on */
 	enable_irq(pdata->resetb_irq);
 
@@ -1349,11 +1365,36 @@ error_reset:
 #ifdef CONFIG_PM
 static int bcm15602_suspend(struct device *dev)
 {
+	struct bcm15602_chip *ddata;
 	struct bcm15602_platform_data *pdata;
+	u8 reg_addr, reg_data;
+	int rid, ret;
 
 	pdata = dev_get_platdata(dev);
 	if (pdata)
 		enable_irq_wake(pdata->intb_irq);
+
+	ddata = dev_get_drvdata(dev);
+	if (!ddata)
+		return 0;
+
+	/* check to see if any regulators were left enabled */
+	for (rid = 0; rid < BCM15602_NUM_REGULATORS; rid++) {
+		if (rid == BCM15602_ID_SDLDO)
+			reg_addr = BCM15602_REG_LDO_SDLDO_ENCTRL;
+		else if (rid == BCM15602_ID_IOLDO)
+			reg_addr = BCM15602_REG_LDO_IOLDO_ENCTRL;
+		else if (rid == BCM15602_ID_ASR)
+			reg_addr = BCM15602_REG_BUCK_ASR_CTRL0;
+		else
+			reg_addr = BCM15602_REG_BUCK_SDSR_CTRL0;
+
+		ret = bcm15602_read_byte(ddata, reg_addr, &reg_data);
+		if (!ret && (reg_data & 0x1))
+			dev_err(dev, "%s: regulator %d is still enabled\n",
+				__func__, rid);
+	}
+
 	return 0;
 }
 

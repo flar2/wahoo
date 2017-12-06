@@ -162,8 +162,42 @@ int
 wmi_unified_pdev_set_param(wmi_unified_t wmi_handle, WMI_PDEV_PARAM param_id,
 			   uint32_t param_value);
 
+/**
+ * wma_send_msg_by_priority() - Send wma message to PE with priority.
+ * @wma_handle: wma handle
+ * @msg_type: message type
+ * @body_ptr: message body ptr
+ * @body_val: message body value
+ * @is_high_priority: if msg is high priority
+ *
+ * Return: none
+ */
+void wma_send_msg_by_priority(tp_wma_handle wma_handle, uint16_t msg_type,
+		void *body_ptr, uint32_t body_val, int is_high_priority);
+
+/**
+ * wma_send_msg() - Send wma message to PE.
+ * @wma_handle: wma handle
+ * @msg_type: message type
+ * @body_ptr: message body ptr
+ * @body_val: message body value
+ *
+ * Return: none
+ */
 void wma_send_msg(tp_wma_handle wma_handle, uint16_t msg_type,
 			 void *body_ptr, uint32_t body_val);
+/**
+ * wma_send_msg_high_priority() - Send wma message to PE with high priority.
+ * @wma_handle: wma handle
+ * @msg_type: message type
+ * @body_ptr: message body ptr
+ * @body_val: message body value
+ *
+ * Return: none
+ */
+void wma_send_msg_high_priority(tp_wma_handle wma_handle, uint16_t msg_type,
+			void *body_ptr, uint32_t body_val);
+
 
 void wma_data_tx_ack_comp_hdlr(void *wma_context,
 				      qdf_nbuf_t netbuf, int32_t status);
@@ -251,20 +285,11 @@ A_UINT32 e_csr_auth_type_to_rsn_authmode(eCsrAuthType authtype,
 
 A_UINT32 e_csr_encryption_type_to_rsn_cipherset(eCsrEncryptionType encr);
 
-void wma_roam_scan_fill_ap_profile(tp_wma_handle wma_handle,
-				   tpAniSirGlobal pMac,
-				   tSirRoamOffloadScanReq *roam_req,
-				   wmi_ap_profile *ap_profile_p);
-
 void wma_roam_scan_fill_scan_params(tp_wma_handle wma_handle,
 				    tpAniSirGlobal pMac,
 				    tSirRoamOffloadScanReq *roam_req,
 				    wmi_start_scan_cmd_fixed_param *
 				    scan_params);
-
-QDF_STATUS wma_roam_scan_offload_ap_profile(tp_wma_handle wma_handle,
-					    wmi_ap_profile *ap_profile_p,
-					    uint32_t vdev_id);
 
 QDF_STATUS wma_roam_scan_bmiss_cnt(tp_wma_handle wma_handle,
 				   A_INT32 first_bcnt,

@@ -566,6 +566,21 @@ static int fg_get_charge_raw(struct fg_chip *chip, int *val)
 	return 0;
 }
 
+#define BATT_SOC_32BIT	GENMASK(31, 0)
+static int fg_get_charge_counter_shadow(struct fg_chip *chip, int *val)
+{
+	int rc, batt_soc;
+
+	rc = fg_get_sram_prop(chip, FG_SRAM_BATT_SOC, &batt_soc);
+	if (rc < 0) {
+		pr_err("Error in getting BATT_SOC, rc=%d\n", rc);
+		return rc;
+	}
+
+	*val = div_u64((u32)batt_soc * chip->cl.learned_cc_uah, BATT_SOC_32BIT);
+	return 0;
+}
+
 static int fg_get_charge_counter(struct fg_chip *chip, int *val)
 {
 	int rc, cc_soc;
@@ -965,7 +980,7 @@ static int fg_get_prop_capacity(struct fg_chip *chip, int *val)
 	if (rc < 0)
 		return rc;
 
-	if (chip->delta_soc > 0)
+	if (chip->dt.linearize_soc && chip->delta_soc > 0)
 		*val = chip->maint_soc;
 	else
 		*val = msoc;
@@ -1042,6 +1057,7 @@ static int fg_get_batt_profile(struct fg_chip *chip)
 	struct device_node *batt_node, *profile_node;
 	const char *data;
 	int rc, len;
+	u32 temp;
 
 	batt_node = of_find_node_by_name(node, "qcom,battery-data");
 	if (!batt_node) {
@@ -1086,6 +1102,14 @@ static int fg_get_batt_profile(struct fg_chip *chip)
 		pr_err("battery cc_cv threshold unavailable, rc:%d\n", rc);
 		chip->bp.vbatt_full_mv = -EINVAL;
 	}
+
+	rc = of_property_read_u32(profile_node, "qcom,fg-chg-term-current", &temp);
+	if (rc >= 0)
+		chip->dt.chg_term_curr_ma = temp;
+
+	rc = of_property_read_u32(profile_node, "qcom,fg-sys-term-current", &temp);
+	if (rc >= 0)
+		chip->dt.sys_term_curr_ma = temp;
 
 	data = of_get_property(profile_node, "qcom,fg-profile-data", &len);
 	if (!data) {
@@ -1291,6 +1315,43 @@ static bool is_parallel_charger_available(struct fg_chip *chip)
 	return true;
 }
 
+static void fg_prime_cc_soc_sw(struct fg_chip *chip)
+{
+	int rc, batt_soc, cc_soc_sw = 0;
+
+	/* If capacity learning is active, don't do anything */
+	if (chip->cl.active)
+		return;
+
+	/* Do nothing if charge_status doesn't change */
+	if (chip->charge_status == chip->prev_charge_status)
+		return;
+
+	/* Prime cc_soc_sw based off charging status */
+	if (chip->charge_status == POWER_SUPPLY_STATUS_DISCHARGING) {
+		rc = fg_get_sram_prop(chip, FG_SRAM_BATT_SOC, &batt_soc);
+		if (rc < 0) {
+			pr_err("Error in getting BATT_SOC, rc=%d\n", rc);
+			return;
+		}
+		cc_soc_sw = div_u64((u32)batt_soc * CC_SOC_30BIT,
+					BATT_SOC_32BIT);
+	} else if (chip->charge_done) {
+		cc_soc_sw = CC_SOC_30BIT;
+	}
+
+	if (!cc_soc_sw)
+		return;
+
+	rc = fg_sram_write(chip, chip->sp[FG_SRAM_CC_SOC_SW].addr_word,
+		chip->sp[FG_SRAM_CC_SOC_SW].addr_byte, (u8 *)&cc_soc_sw,
+		chip->sp[FG_SRAM_CC_SOC_SW].len, FG_IMA_ATOMIC);
+	if (rc < 0)
+		pr_err("Error in writing cc_soc_sw, rc=%d\n", rc);
+	else
+		fg_dbg(chip, FG_STATUS, "cc_soc_sw: %x\n", cc_soc_sw);
+}
+
 static int fg_save_learned_cap_to_sram(struct fg_chip *chip)
 {
 	int16_t cc_mah;
@@ -1467,7 +1528,6 @@ static int fg_cap_learning_process_full_data(struct fg_chip *chip)
 	return 0;
 }
 
-#define BATT_SOC_32BIT	GENMASK(31, 0)
 static int fg_cap_learning_begin(struct fg_chip *chip, u32 batt_soc)
 {
 	int rc, cc_soc_sw, batt_soc_msb;
@@ -1664,6 +1724,8 @@ static int fg_adjust_ki_coeff_full_soc(struct fg_chip *chip, int batt_temp)
 
 	if (batt_temp < 0)
 		ki_coeff_full_soc = 0;
+	else if (chip->charge_status == POWER_SUPPLY_STATUS_DISCHARGING)
+		ki_coeff_full_soc = chip->dt.ki_coeff_full_soc_dischg;
 	else
 		ki_coeff_full_soc = KI_COEFF_FULL_SOC_DEFAULT;
 
@@ -1716,12 +1778,38 @@ static int fg_set_recharge_voltage(struct fg_chip *chip, int voltage_mv)
 	return 0;
 }
 
+static int fg_configure_full_soc(struct fg_chip *chip, int bsoc)
+{
+	int rc;
+	u8 full_soc[2] = {0xFF, 0xFF};
+
+	/*
+	 * Once SOC masking condition is cleared, FULL_SOC and MONOTONIC_SOC
+	 * needs to be updated to reflect the same. Write battery SOC to
+	 * FULL_SOC and write a full value to MONOTONIC_SOC.
+	 */
+	rc = fg_sram_write(chip, FULL_SOC_WORD, FULL_SOC_OFFSET,
+			(u8 *)&bsoc, 2, FG_IMA_ATOMIC);
+	if (rc < 0) {
+		pr_err("failed to write full_soc rc=%d\n", rc);
+		return rc;
+	}
+
+	rc = fg_sram_write(chip, MONOTONIC_SOC_WORD, MONOTONIC_SOC_OFFSET,
+			full_soc, 2, FG_IMA_ATOMIC);
+	if (rc < 0) {
+		pr_err("failed to write monotonic_soc rc=%d\n", rc);
+		return rc;
+	}
+
+	return 0;
+}
+
 #define AUTO_RECHG_VOLT_LOW_LIMIT_MV	3700
 static int fg_charge_full_update(struct fg_chip *chip)
 {
 	union power_supply_propval prop = {0, };
 	int rc, msoc, bsoc, recharge_soc, msoc_raw;
-	u8 full_soc[2] = {0xFF, 0xFF};
 
 	if (!chip->dt.hold_soc_while_full)
 		return 0;
@@ -1756,7 +1844,12 @@ static int fg_charge_full_update(struct fg_chip *chip)
 		pr_err("Error in getting msoc, rc=%d\n", rc);
 		goto out;
 	}
-	msoc_raw = DIV_ROUND_CLOSEST(msoc * FULL_SOC_RAW, FULL_CAPACITY);
+
+	rc = fg_get_msoc_raw(chip, &msoc_raw);
+	if (rc < 0) {
+		pr_err("Error in getting msoc_raw, rc=%d\n", rc);
+		goto out;
+	}
 
 	fg_dbg(chip, FG_STATUS, "msoc: %d bsoc: %x health: %d status: %d full: %d\n",
 		msoc, bsoc, chip->health, chip->charge_status,
@@ -1780,23 +1873,24 @@ static int fg_charge_full_update(struct fg_chip *chip)
 			fg_dbg(chip, FG_STATUS, "Terminated charging @ SOC%d\n",
 				msoc);
 		}
-	} else if (msoc_raw <= recharge_soc && chip->charge_full) {
-		chip->delta_soc = FULL_CAPACITY - msoc;
+	} else if ((msoc_raw <= recharge_soc || !chip->charge_done)
+		    && chip->charge_full) {
+		if (chip->dt.linearize_soc) {
+			chip->delta_soc = FULL_CAPACITY - msoc;
 
-		/*
-		 * We're spreading out the delta SOC over every 10% change
-		 * in monotonic SOC. We cannot spread more than 9% in the
-		 * range of 0-100 skipping the first 10%.
-		 */
-		if (chip->delta_soc > 9) {
-			chip->delta_soc = 0;
-			chip->maint_soc = 0;
-		} else {
-			chip->maint_soc = FULL_CAPACITY;
-			chip->last_msoc = msoc;
+			/*
+			 * We're spreading out the delta SOC over every 10%
+			 * change in monotonic SOC. We cannot spread more than
+			 * 9% in the range of 0-100 skipping the first 10%.
+			 */
+			if (chip->delta_soc > 9) {
+				chip->delta_soc = 0;
+				chip->maint_soc = 0;
+			} else {
+				chip->maint_soc = FULL_CAPACITY;
+				chip->last_msoc = msoc;
+			}
 		}
-
-		chip->charge_full = false;
 
 		/*
 		 * Raise the recharge voltage so that VBAT_LT_RECHG signal
@@ -1810,35 +1904,23 @@ static int fg_charge_full_update(struct fg_chip *chip)
 				rc);
 			goto out;
 		}
+
+		/*
+		 * If charge_done is still set, wait for recharging or
+		 * discharging to happen.
+		 */
+		if (chip->charge_done)
+			goto out;
+
+		rc = fg_configure_full_soc(chip, bsoc);
+		if (rc < 0)
+			goto out;
+
+		chip->charge_full = false;
 		fg_dbg(chip, FG_STATUS, "msoc_raw = %d bsoc: %d recharge_soc: %d delta_soc: %d\n",
 			msoc_raw, bsoc >> 8, recharge_soc, chip->delta_soc);
-	} else {
-		goto out;
 	}
 
-	if (!chip->charge_full)
-		goto out;
-
-	/*
-	 * During JEITA conditions, charge_full can happen early. FULL_SOC
-	 * and MONOTONIC_SOC needs to be updated to reflect the same. Write
-	 * battery SOC to FULL_SOC and write a full value to MONOTONIC_SOC.
-	 */
-	rc = fg_sram_write(chip, FULL_SOC_WORD, FULL_SOC_OFFSET, (u8 *)&bsoc, 2,
-			FG_IMA_ATOMIC);
-	if (rc < 0) {
-		pr_err("failed to write full_soc rc=%d\n", rc);
-		goto out;
-	}
-
-	rc = fg_sram_write(chip, MONOTONIC_SOC_WORD, MONOTONIC_SOC_OFFSET,
-			full_soc, 2, FG_IMA_ATOMIC);
-	if (rc < 0) {
-		pr_err("failed to write monotonic_soc rc=%d\n", rc);
-		goto out;
-	}
-
-	fg_dbg(chip, FG_STATUS, "Set charge_full to true @ soc %d\n", msoc);
 out:
 	mutex_unlock(&chip->charge_full_lock);
 	return rc;
@@ -2242,9 +2324,6 @@ static int fg_esr_timer_config(struct fg_chip *chip, bool sleep)
 
 static void fg_batt_avg_update(struct fg_chip *chip)
 {
-	if (chip->charge_status == chip->prev_charge_status)
-		return;
-
 	cancel_delayed_work_sync(&chip->batt_avg_work);
 	fg_circ_buf_clr(&chip->ibatt_circ_buf);
 	fg_circ_buf_clr(&chip->vbatt_circ_buf);
@@ -2274,7 +2353,6 @@ static void status_change_work(struct work_struct *work)
 		goto out;
 	}
 
-	chip->prev_charge_status = chip->charge_status;
 	chip->charge_status = prop.intval;
 	rc = power_supply_get_property(chip->batt_psy,
 			POWER_SUPPLY_PROP_CHARGE_TYPE, &prop);
@@ -2295,6 +2373,7 @@ static void status_change_work(struct work_struct *work)
 	if (chip->cyc_ctr.en)
 		schedule_work(&chip->cycle_count_work);
 
+	fg_prime_cc_soc_sw(chip);
 	fg_cap_learning_update(chip);
 
 	rc = fg_charge_full_update(chip);
@@ -2331,7 +2410,7 @@ static void status_change_work(struct work_struct *work)
 	}
 
 	fg_batt_avg_update(chip);
-
+	chip->prev_charge_status = chip->charge_status;
 out:
 	fg_dbg(chip, FG_POWER_SUPPLY, "charge_status:%d charge_type:%d charge_done:%d\n",
 		chip->charge_status, chip->charge_type, chip->charge_done);
@@ -3054,6 +3133,9 @@ static int fg_update_maint_soc(struct fg_chip *chip)
 {
 	int rc = 0, msoc;
 
+	if (!chip->dt.linearize_soc)
+		return 0;
+
 	mutex_lock(&chip->charge_full_lock);
 	if (chip->delta_soc <= 0)
 		goto out;
@@ -3138,6 +3220,9 @@ static int fg_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		rc = fg_get_prop_capacity(chip, &pval->intval);
 		break;
+	case POWER_SUPPLY_PROP_CAPACITY_RAW:
+		rc = fg_get_msoc_raw(chip, &pval->intval);
+		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 		if (chip->battery_missing)
 			pval->intval = 3700000;
@@ -3185,6 +3270,9 @@ static int fg_psy_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
 		rc = fg_get_charge_counter(chip, &pval->intval);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_COUNTER_SHADOW:
+		rc = fg_get_charge_counter_shadow(chip, &pval->intval);
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
 		rc = fg_get_time_to_full(chip, &pval->intval);
@@ -3286,6 +3374,7 @@ static int fg_notifier_cb(struct notifier_block *nb,
 
 static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CAPACITY_RAW,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_OCV,
@@ -3301,6 +3390,7 @@ static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_NOW,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER_SHADOW,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
 	POWER_SUPPLY_PROP_SOC_REPORTING_READY,
@@ -4058,7 +4148,11 @@ static int fg_parse_slope_limit_coefficients(struct fg_chip *chip)
 static int fg_parse_ki_coefficients(struct fg_chip *chip)
 {
 	struct device_node *node = chip->dev->of_node;
-	int rc, i;
+	int rc, i, temp;
+
+	rc = of_property_read_u32(node, "qcom,ki-coeff-full-dischg", &temp);
+	if (!rc)
+		chip->dt.ki_coeff_full_soc_dischg = temp;
 
 	rc = fg_parse_dt_property_u32_array(node, "qcom,ki-coeff-soc-dischg",
 		chip->dt.ki_coeff_soc, KI_COEFF_SOC_LEVELS);
@@ -4402,6 +4496,9 @@ static int fg_parse_dt(struct fg_chip *chip)
 
 	chip->dt.hold_soc_while_full = of_property_read_bool(node,
 					"qcom,hold-soc-while-full");
+
+	chip->dt.linearize_soc = of_property_read_bool(node,
+					"qcom,linearize-soc");
 
 	rc = fg_parse_ki_coefficients(chip);
 	if (rc < 0)
@@ -4818,6 +4915,29 @@ static int fg_gen3_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static void fg_gen3_shutdown(struct platform_device *pdev)
+{
+	struct fg_chip *chip = dev_get_drvdata(&pdev->dev);
+	int rc, bsoc;
+
+	if (chip->charge_full) {
+		rc = fg_get_sram_prop(chip, FG_SRAM_BATT_SOC, &bsoc);
+		if (rc < 0) {
+			pr_err("Error in getting BATT_SOC, rc=%d\n", rc);
+			return;
+		}
+
+		/* We need 2 most significant bytes here */
+		bsoc = (u32)bsoc >> 16;
+
+		rc = fg_configure_full_soc(chip, bsoc);
+		if (rc < 0) {
+			pr_err("Error in configuring full_soc, rc=%d\n", rc);
+			return;
+		}
+	}
+}
+
 static const struct of_device_id fg_gen3_match_table[] = {
 	{.compatible = FG_GEN3_DEV_NAME},
 	{},
@@ -4832,6 +4952,7 @@ static struct platform_driver fg_gen3_driver = {
 	},
 	.probe		= fg_gen3_probe,
 	.remove		= fg_gen3_remove,
+	.shutdown	= fg_gen3_shutdown,
 };
 
 static int __init fg_gen3_init(void)

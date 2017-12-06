@@ -1372,6 +1372,7 @@ static void tcpm_pd_ctrl_request(struct tcpm_port *port,
 				tcpm_set_current_limit(port,
 						       port->current_limit,
 						       port->supply_voltage);
+				port->explicit_contract = true;
 				tcpm_set_state(port, SNK_READY, 0);
 			} else {
 				/*
@@ -2134,9 +2135,23 @@ static void tcpm_swap_complete(struct tcpm_port *port, int result)
 	}
 }
 
+enum typec_pwr_opmode tcpm_get_pwr_opmode(enum typec_cc_status cc)
+{
+	switch (cc) {
+	case TYPEC_CC_RP_1_5:
+		return TYPEC_PWR_MODE_1_5A;
+	case TYPEC_CC_RP_3_0:
+		return TYPEC_PWR_MODE_3_0A;
+	case TYPEC_CC_RP_DEF:
+	default:
+		return TYPEC_PWR_MODE_USB;
+	}
+}
+
 static void run_state_machine(struct tcpm_port *port)
 {
 	int ret;
+	enum typec_pwr_opmode opmode;
 
 	port->enter_state = port->state;
 	switch (port->state) {
@@ -2214,7 +2229,8 @@ static void run_state_machine(struct tcpm_port *port)
 			       ret < 0 ? 0 : PD_T_PS_SOURCE_ON);
 		break;
 	case SRC_STARTUP:
-		typec_set_pwr_opmode(port->typec_port, TYPEC_PWR_MODE_USB);
+		opmode =  tcpm_get_pwr_opmode(tcpm_rp_cc(port));
+		typec_set_pwr_opmode(port->typec_port, opmode);
 		port->pwr_opmode = TYPEC_PWR_MODE_USB;
 		port->caps_count = 0;
 		port->message_id = 0;
@@ -2374,7 +2390,9 @@ static void run_state_machine(struct tcpm_port *port)
 		break;
 	case SNK_STARTUP:
 		/* XXX: callback into infrastructure */
-		typec_set_pwr_opmode(port->typec_port, TYPEC_PWR_MODE_USB);
+		opmode =  tcpm_get_pwr_opmode(port->polarity ?
+					       port->cc2 : port->cc1);
+		typec_set_pwr_opmode(port->typec_port, opmode);
 		port->pwr_opmode = TYPEC_PWR_MODE_USB;
 		port->message_id = 0;
 		port->rx_msgid = -1;
@@ -2454,9 +2472,11 @@ static void run_state_machine(struct tcpm_port *port)
 		break;
 	case SNK_READY:
 		port->try_snk_count = 0;
-		port->explicit_contract = true;
-		typec_set_pwr_opmode(port->typec_port, TYPEC_PWR_MODE_PD);
-		port->pwr_opmode = TYPEC_PWR_MODE_PD;
+		if (port->explicit_contract) {
+			typec_set_pwr_opmode(port->typec_port,
+					     TYPEC_PWR_MODE_PD);
+			port->pwr_opmode = TYPEC_PWR_MODE_PD;
+		}
 
 		tcpm_swap_complete(port, 0);
 		tcpm_typec_connect(port);
@@ -2966,6 +2986,7 @@ static void _tcpm_pd_vbus_on(struct tcpm_port *port)
 	port->vbus_present = true;
 	switch (port->state) {
 	case SNK_TRANSITION_SINK_VBUS:
+		port->explicit_contract = true;
 		tcpm_set_state(port, SNK_READY, 0);
 		break;
 	case SNK_DISCOVERY:

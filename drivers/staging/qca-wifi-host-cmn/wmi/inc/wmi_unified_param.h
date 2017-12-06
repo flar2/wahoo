@@ -98,6 +98,7 @@
 #define WMI_MSEC_TO_USEC(msec)       (msec * 1000) /* msec to usec */
 #define WMI_NLO_FREQ_THRESH          1000       /* in MHz */
 
+#define WMI_SVC_MSG_MAX_SIZE   1536
 #define MAX_UTF_EVENT_LENGTH	2048
 #define MAX_WMI_UTF_LEN	252
 #define MAX_WMI_QVIT_LEN	252
@@ -1237,6 +1238,63 @@ struct seg_hdr_info {
 };
 
 /**
+ * struct tx_send_params - TX parameters
+ * @pwr: Tx frame transmission power
+ * @mcs_mask: Modulation and coding index mask for transmission
+ *	      bit  0 -> CCK 1 Mbps rate is allowed
+ *	      bit  1 -> CCK 2 Mbps rate is allowed
+ *	      bit  2 -> CCK 5.5 Mbps rate is allowed
+ *	      bit  3 -> CCK 11 Mbps rate is allowed
+ *	      bit  4 -> OFDM BPSK modulation, 1/2 coding rate is allowed
+ *	      bit  5 -> OFDM BPSK modulation, 3/4 coding rate is allowed
+ *	      bit  6 -> OFDM QPSK modulation, 1/2 coding rate is allowed
+ *	      bit  7 -> OFDM QPSK modulation, 3/4 coding rate is allowed
+ *	      bit  8 -> OFDM 16-QAM modulation, 1/2 coding rate is allowed
+ *	      bit  9 -> OFDM 16-QAM modulation, 3/4 coding rate is allowed
+ *	      bit 10 -> OFDM 64-QAM modulation, 2/3 coding rate is allowed
+ *	      bit 11 -> OFDM 64-QAM modulation, 3/4 coding rate is allowed
+ * @nss_mask: Spatial streams permitted
+ *	      bit 0: if set, Nss = 1 (non-MIMO) is permitted
+ *	      bit 1: if set, Nss = 2 (2x2 MIMO) is permitted
+ *	      bit 2: if set, Nss = 3 (3x3 MIMO) is permitted
+ *	      bit 3: if set, Nss = 4 (4x4 MIMO) is permitted
+ *	      bit 4: if set, Nss = 5 (5x5 MIMO) is permitted
+ *	      bit 5: if set, Nss = 6 (6x6 MIMO) is permitted
+ *	      bit 6: if set, Nss = 7 (7x7 MIMO) is permitted
+ *	      bit 7: if set, Nss = 8 (8x8 MIMO) is permitted
+ *            If no bits are set, target will choose what NSS type to use
+ * @retry_limit: Maximum number of retries before ACK
+ * @chain_mask: Chains to be used for transmission
+ * @bw_mask: Bandwidth to be used for transmission
+ *	     bit  0 -> 5MHz
+ *	     bit  1 -> 10MHz
+ *	     bit  2 -> 20MHz
+ *	     bit  3 -> 40MHz
+ *	     bit  4 -> 80MHz
+ *	     bit  5 -> 160MHz
+ *	     bit  6 -> 80_80MHz
+ * @preamble_type: Preamble types for transmission
+ *	     bit 0: if set, OFDM
+ *	     bit 1: if set, CCK
+ *	     bit 2: if set, HT
+ *	     bit 3: if set, VHT
+ *	     bit 4: if set, HE
+ * @frame_type: Data or Management frame
+ *	        Data:1 Mgmt:0
+ */
+struct tx_send_params {
+	uint32_t pwr:8,
+		 mcs_mask:12,
+		 nss_mask:8,
+		 retry_limit:4;
+	uint32_t chain_mask:8,
+		 bw_mask:7,
+		 preamble_type:5,
+		 frame_type:1,
+		 reserved:11;
+};
+
+/**
  * struct wmi_mgmt_params - wmi mgmt cmd paramters
  * @tx_frame: management tx frame
  * @frm_len: frame length
@@ -1248,6 +1306,9 @@ struct seg_hdr_info {
  * @wmi_desc: command descriptor
  * @desc_id: descriptor id relyaed back by target
  * @macaddr - macaddr of peer
+ * @qdf_ctx: qdf context for qdf_nbuf_map
+ * @tx_param: TX send parameters
+ * @tx_params_valid: Flag that indicates if TX params are valid
  */
 struct wmi_mgmt_params {
 	void *tx_frame;
@@ -1258,6 +1319,8 @@ struct wmi_mgmt_params {
 	uint16_t desc_id;
 	uint8_t *macaddr;
 	void *qdf_ctx;
+	struct tx_send_params tx_param;
+	bool tx_params_valid;
 };
 
 /**
@@ -1830,7 +1893,11 @@ struct roam_offload_scan_params {
  * @initial_dense_status: dense status detected by host
  * @traffic_threshold: dense roam RSSI threshold
  * @bg_scan_bad_rssi_thresh: Bad RSSI threshold to perform bg scan
+ * @roam_bad_rssi_thresh_offset_2g: Offset from Bad RSSI threshold for 2G to 5G Roam
  * @bg_scan_client_bitmap: Bitmap used to identify the client scans to snoop
+ * @flags: Flags for Background Roaming
+ *	Bit 0 : BG roaming enabled when we connect to 2G AP only and roaming to 5G AP only.
+ *	Bit 1-31: Reserved
  */
 struct roam_offload_scan_rssi_params {
 	int8_t rssi_thresh;
@@ -1854,7 +1921,170 @@ struct roam_offload_scan_rssi_params {
 	int initial_dense_status;
 	int traffic_threshold;
 	int8_t bg_scan_bad_rssi_thresh;
+	uint8_t roam_bad_rssi_thresh_offset_2g;
 	uint32_t bg_scan_client_bitmap;
+	int32_t rssi_thresh_offset_5g;
+	uint32_t flags;
+};
+
+/**
+ * struct ap_profile - Structure ap profile to match candidate
+ * @flags: flags
+ * @rssi_threshold: the value of the the candidate AP should higher by this
+ *                  threshold than the rssi of the currrently associated AP
+ * @ssid: ssid vlaue to be matched
+ * @rsn_authmode: security params to be matched
+ * @rsn_ucastcipherset: unicast cipher set
+ * @rsn_mcastcipherset: mcast/group cipher set
+ * @rsn_mcastmgmtcipherset: mcast/group management frames cipher set
+ * @rssi_abs_thresh: the value of the candidate AP should higher than this
+ *                   absolute RSSI threshold. Zero means no absolute minimum
+ *                   RSSI is required. units are the offset from the noise
+ *                   floor in dB
+ */
+struct ap_profile {
+	uint32_t flags;
+	uint32_t rssi_threshold;
+	struct mac_ssid  ssid;
+	uint32_t rsn_authmode;
+	uint32_t rsn_ucastcipherset;
+	uint32_t rsn_mcastcipherset;
+	uint32_t rsn_mcastmgmtcipherset;
+	uint32_t rssi_abs_thresh;
+};
+
+/**
+ * struct rssi_scoring - rssi scoring param to sortlist selected AP
+ * @best_rssi_threshold: Roamable AP RSSI equal or better than this threshold,
+ *                      full rssi score 100. Units in dBm.
+ * @good_rssi_threshold: Below threshold, scoring linear percentage between
+ *                      rssi_good_pnt and 100. Units in dBm.
+ * @bad_rssi_threshold: Between good and bad rssi threshold, scoring linear
+ *                      % between rssi_bad_pcnt and rssi_good_pct in dBm.
+ * @good_rssi_pcnt: Used to assigned scoring percentage of each slot between
+ *                 best to good rssi threshold. Units in percentage.
+ * @bad_rssi_pcnt: Used to assigned scoring percentage of each slot between good
+ *                to bad rssi threshold. Unites in percentage.
+ * @good_bucket_size : bucket size of slot in good zone
+ * @bad_bucket_size : bucket size of slot in bad zone
+ * @rssi_pref_5g_rssi_thresh: Below rssi threshold, 5G AP have given preference
+ *                           of band percentage. Units in dBm.
+ */
+struct rssi_scoring {
+	int32_t best_rssi_threshold;
+	int32_t good_rssi_threshold;
+	int32_t  bad_rssi_threshold;
+	uint32_t good_rssi_pcnt;
+	uint32_t bad_rssi_pcnt;
+	uint32_t good_bucket_size;
+	uint32_t bad_bucket_size;
+	int32_t  rssi_pref_5g_rssi_thresh;
+};
+
+/**
+ * struct param_slot_scoring - define % score for differents slots for a
+ *                             scoring param.
+ * @num_slot: number of slots in which the param will be divided.
+ *           Max 15. index 0 is used for 'not_present. Num_slot will
+ *           equally divide 100. e.g, if num_slot = 4 slot 0 = 0-25%, slot
+ *           1 = 26-50% slot 2 = 51-75%, slot 3 = 76-100%
+ * @score_pcnt3_to_0: Conatins score percentage for slot 0-3
+ *             BITS 0-7   :- the scoring pcnt when not present
+ *             BITS 8-15  :- SLOT_1
+ *             BITS 16-23 :- SLOT_2
+ *             BITS 24-31 :- SLOT_3
+ * @score_pcnt7_to_4: Conatins score percentage for slot 4-7
+ *             BITS 0-7   :- SLOT_4
+ *             BITS 8-15  :- SLOT_5
+ *             BITS 16-23 :- SLOT_6
+ *             BITS 24-31 :- SLOT_7
+ * @score_pcnt11_to_8: Conatins score percentage for slot 8-11
+ *             BITS 0-7   :- SLOT_8
+ *             BITS 8-15  :- SLOT_9
+ *             BITS 16-23 :- SLOT_10
+ *             BITS 24-31 :- SLOT_11
+ * @score_pcnt15_to_12: Conatins score percentage for slot 12-15
+ *             BITS 0-7   :- SLOT_12
+ *             BITS 8-15  :- SLOT_13
+ *             BITS 16-23 :- SLOT_14
+ *             BITS 24-31 :- SLOT_15
+ */
+struct param_slot_scoring {
+	uint32_t num_slot;
+	uint32_t score_pcnt3_to_0;
+	uint32_t score_pcnt7_to_4;
+	uint32_t score_pcnt11_to_8;
+	uint32_t score_pcnt15_to_12;
+};
+
+/**
+ * struct scoring_param - scoring param to sortlist selected AP
+ * @disable_bitmap: Each bit will be either allow(0)/disallow(1) to
+ *                 considered the roam score param.
+ * @rssi_weightage: RSSI weightage out of total score in %
+ * @ht_weightage: HT weightage out of total score in %.
+ * @vht_weightage: VHT weightage out of total score in %.
+ * @he_weightaget: 11ax weightage out of total score in %.
+ * @bw_weightage: Bandwidth weightage out of total score in %.
+ * @band_weightage: Band(2G/5G) weightage out of total score in %.
+ * @nss_weightage: NSS(1x1 / 2x2)weightage out of total score in %.
+ * @esp_qbss_weightage: ESP/QBSS weightage out of total score in %.
+ * @beamforming_weightage: Beamforming weightage out of total score in %.
+ * @pcl_weightage: PCL weightage out of total score in %.
+ * @oce_wan_weightage OCE WAN metrics weightage out of total score in %.
+ * @bw_index_score: channel BW scoring percentage information.
+ *                 BITS 0-7   :- It contains scoring percentage of 20MHz   BW
+ *                 BITS 8-15  :- It contains scoring percentage of 40MHz   BW
+ *                 BITS 16-23 :- It contains scoring percentage of 80MHz   BW
+ *                 BITS 24-31 :- It contains scoring percentage of 1600MHz BW
+ *                 The value of each index must be 0-100
+ * @band_index_score: band scording percentage information.
+ *                   BITS 0-7   :- It contains scoring percentage of 2G
+ *                   BITS 8-15  :- It contains scoring percentage of 5G
+ *                   BITS 16-23 :- reserved
+ *                   BITS 24-31 :- reserved
+ *                   The value of each index must be 0-100
+ * @nss_index_score: NSS scoring percentage information.
+ *                  BITS 0-7   :- It contains scoring percentage of 1x1
+ *                  BITS 8-15  :- It contains scoring percentage of 2x2
+ *                  BITS 16-23 :- It contains scoring percentage of 3x3
+ *                  BITS 24-31 :- It contains scoring percentage of 4x4
+ *                  The value of each index must be 0-100
+ * @rssi_scoring: RSSI scoring information.
+ * @esp_qbss_scoring: ESP/QBSS scoring percentage information
+ * @oce_wan_scoring: OCE WAN metrics percentage information
+*/
+struct scoring_param {
+	uint32_t disable_bitmap;
+	int32_t rssi_weightage;
+	int32_t ht_weightage;
+	int32_t vht_weightage;
+	int32_t he_weightage;
+	int32_t bw_weightage;
+	int32_t band_weightage;
+	int32_t nss_weightage;
+	int32_t esp_qbss_weightage;
+	int32_t beamforming_weightage;
+	int32_t pcl_weightage;
+	int32_t oce_wan_weightage;
+	uint32_t bw_index_score;
+	uint32_t band_index_score;
+	uint32_t nss_index_score;
+	struct rssi_scoring rssi_scoring;
+	struct param_slot_scoring esp_qbss_scoring;
+	struct param_slot_scoring oce_wan_scoring;
+};
+
+/**
+ * struct ap_profile_params - ap profile params
+ * @vdev_id: vdev id
+ * @profile: ap profile to match candidate
+ * @param: scoring params to short candidate
+ */
+struct ap_profile_params {
+	uint8_t vdev_id;
+	struct ap_profile profile;
+	struct scoring_param param;
 };
 
 /**
@@ -3069,6 +3299,18 @@ struct gtk_offload_params {
 };
 
 /**
+ * struct mcast_filter_params - mcast filter parameters
+ * @multicast_addr_cnt: num of addresses
+ * @multicast_addr: address array
+ * @action: operation to perform
+ */
+struct mcast_filter_params {
+	uint32_t multicast_addr_cnt;
+	struct qdf_mac_addr multicast_addr[WMI_MAX_NUM_MULTICAST_ADDRESS];
+	uint8_t action;
+};
+
+/**
  * struct flashing_req_params - led flashing parameter
  * @reqId: request id
  * @pattern_id: pattern identifier. 0: disconnected 1: connected
@@ -3293,7 +3535,6 @@ struct ssid_hotlist_param {
 /**
  * struct roam_scan_filter_params - Structure holding roaming scan
  *                                  parameters
- * @len:                      length
  * @op_bitmap:                bitmap to determine reason of roaming
  * @session_id:               vdev id
  * @num_bssid_black_list:     The number of BSSID's that we should
@@ -3323,7 +3564,6 @@ struct ssid_hotlist_param {
  */
 
 struct roam_scan_filter_params {
-	uint32_t len;
 	uint32_t op_bitmap;
 	uint8_t session_id;
 	uint32_t num_bssid_black_list;

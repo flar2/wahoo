@@ -96,6 +96,11 @@ int easelcomm_hw_ap_setup_cmdchans(void)
 	struct mnh_outb_region outbound;
 	int ret;
 
+	/* Command channel size shall not exceed the translation region size */
+	BUILD_BUG_ON_MSG(
+		EASELCOMM_CMD_CHANNEL_SIZE > HW_MNH_PCIE_OUTBOUND_SIZE,
+	       "Easelcomm command channel size exceeds translation region");
+
 	ret = mnh_get_rb_base(&easel_cmdchan_dma_addr);
 	if (WARN_ON(ret))
 		return ret;
@@ -483,6 +488,12 @@ void *easelcomm_hw_build_scatterlist(struct easelcomm_kbuf_desc *buf_desc,
 }
 EXPORT_SYMBOL(easelcomm_hw_build_scatterlist);
 
+int easelcomm_hw_verify_scatterlist(struct easelcomm_dma_xfer_info *xfer)
+{
+	return mnh_sg_verify(xfer->sg_local, xfer->sg_local_size,
+		xfer->sg_local_localdata);
+}
+
 /*
  * Return the number of scatter-gather entries in the MNH SG list.  Used to
  * determine whether both sides require only 1 block and can use single-block
@@ -490,7 +501,10 @@ EXPORT_SYMBOL(easelcomm_hw_build_scatterlist);
  */
 int easelcomm_hw_scatterlist_block_count(uint32_t scatterlist_size)
 {
-	return scatterlist_size / sizeof(struct mnh_sg_entry);
+	if (scatterlist_size == 0)
+		return 0;
+	scatterlist_size /= sizeof(struct mnh_sg_entry);
+	return scatterlist_size - 1; /* subtract the terminator entry */
 }
 EXPORT_SYMBOL(easelcomm_hw_scatterlist_block_count);
 

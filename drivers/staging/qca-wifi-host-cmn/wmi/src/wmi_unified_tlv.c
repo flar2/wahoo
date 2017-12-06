@@ -1810,6 +1810,48 @@ end:
 	return qdf_status;
 }
 #endif
+
+/**
+ * populate_tx_send_params - Populate TX param TLV for mgmt and offchan tx
+ *
+ * @bufp: Pointer to buffer
+ * @param: Pointer to tx param
+ *
+ * Return: QDF_STATUS_SUCCESS for success and QDF_STATUS_E_FAILURE for failure
+ */
+static inline QDF_STATUS populate_tx_send_params(uint8_t *bufp,
+					 struct tx_send_params param)
+{
+	wmi_tx_send_params *tx_param;
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
+
+	if (!bufp) {
+		status = QDF_STATUS_E_FAILURE;
+		return status;
+	}
+	tx_param = (wmi_tx_send_params *)bufp;
+	WMITLV_SET_HDR(&tx_param->tlv_header,
+		       WMITLV_TAG_STRUC_wmi_tx_send_params,
+		       WMITLV_GET_STRUCT_TLVLEN(wmi_tx_send_params));
+	WMI_TX_SEND_PARAM_PWR_SET(tx_param->tx_param_dword0, param.pwr);
+	WMI_TX_SEND_PARAM_MCS_MASK_SET(tx_param->tx_param_dword0,
+				       param.mcs_mask);
+	WMI_TX_SEND_PARAM_NSS_MASK_SET(tx_param->tx_param_dword0,
+				       param.nss_mask);
+	WMI_TX_SEND_PARAM_RETRY_LIMIT_SET(tx_param->tx_param_dword0,
+					  param.retry_limit);
+	WMI_TX_SEND_PARAM_CHAIN_MASK_SET(tx_param->tx_param_dword1,
+					 param.chain_mask);
+	WMI_TX_SEND_PARAM_BW_MASK_SET(tx_param->tx_param_dword1,
+				      param.bw_mask);
+	WMI_TX_SEND_PARAM_PREAMBLE_SET(tx_param->tx_param_dword1,
+				       param.preamble_type);
+	WMI_TX_SEND_PARAM_FRAME_TYPE_SET(tx_param->tx_param_dword1,
+					 param.frame_type);
+
+	return status;
+}
+
 /**
  *  send_mgmt_cmd_tlv() - WMI scan start function
  *  @wmi_handle      : handle to WMI.
@@ -1826,14 +1868,15 @@ QDF_STATUS send_mgmt_cmd_tlv(wmi_unified_t wmi_handle,
 	uint64_t dma_addr;
 	void *qdf_ctx = param->qdf_ctx;
 	uint8_t *bufp;
-	QDF_STATUS status;
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
 	int32_t bufp_len = (param->frm_len < mgmt_tx_dl_frm_len) ? param->frm_len :
 		mgmt_tx_dl_frm_len;
 
 	cmd_len = sizeof(wmi_mgmt_tx_send_cmd_fixed_param) +
-		WMI_TLV_HDR_SIZE + roundup(bufp_len, sizeof(uint32_t));
+		  WMI_TLV_HDR_SIZE +
+		  roundup(bufp_len, sizeof(uint32_t));
 
-	buf = wmi_buf_alloc(wmi_handle, cmd_len);
+	buf = wmi_buf_alloc(wmi_handle, sizeof(wmi_tx_send_params) + cmd_len);
 	if (!buf) {
 		WMI_LOGE("%s:wmi_buf_alloc failed", __func__);
 		return QDF_STATUS_E_NOMEM;
@@ -1870,9 +1913,21 @@ QDF_STATUS send_mgmt_cmd_tlv(wmi_unified_t wmi_handle,
 #endif
 	cmd->frame_len = param->frm_len;
 	cmd->buf_len = bufp_len;
+	cmd->tx_params_valid = param->tx_params_valid;
 
 	wmi_mgmt_cmd_record(wmi_handle, WMI_MGMT_TX_SEND_CMDID,
 			bufp, cmd->vdev_id, cmd->chanfreq);
+
+	bufp += roundup(bufp_len, sizeof(uint32_t));
+	if (param->tx_params_valid) {
+		status = populate_tx_send_params(bufp, param->tx_param);
+		if (status != QDF_STATUS_SUCCESS) {
+			WMI_LOGE("%s: Populate TX send params failed",
+				 __func__);
+			goto err1;
+		}
+		cmd_len += sizeof(wmi_tx_send_params);
+	}
 
 	if (wmi_unified_cmd_send(wmi_handle, buf, cmd_len,
 				      WMI_MGMT_TX_SEND_CMDID)) {
@@ -4743,6 +4798,8 @@ QDF_STATUS send_roam_scan_offload_rssi_thresh_cmd_tlv(wmi_unified_t wmi_handle,
 	rssi_threshold_fp->hirssi_scan_delta =
 			roam_req->hi_rssi_scan_rssi_delta;
 	rssi_threshold_fp->hirssi_upper_bound = roam_req->hi_rssi_scan_rssi_ub;
+	rssi_threshold_fp->rssi_thresh_offset_5g =
+		roam_req->rssi_thresh_offset_5g;
 
 	buf_ptr += sizeof(wmi_roam_scan_rssi_threshold_fixed_param);
 	WMITLV_SET_HDR(buf_ptr,
@@ -4810,6 +4867,9 @@ QDF_STATUS send_roam_scan_offload_rssi_thresh_cmd_tlv(wmi_unified_t wmi_handle,
 		roam_req->bg_scan_bad_rssi_thresh;
 	bg_scan_params->roam_bg_scan_client_bitmap =
 		roam_req->bg_scan_client_bitmap;
+	bg_scan_params->bad_rssi_thresh_offset_2g =
+		roam_req->roam_bad_rssi_thresh_offset_2g;
+	bg_scan_params->flags = roam_req->flags;
 	WMITLV_SET_HDR(&bg_scan_params->tlv_header,
 			WMITLV_TAG_STRUC_wmi_roam_bg_scan_roaming_param,
 			WMITLV_GET_STRUCT_TLVLEN
@@ -4984,8 +5044,21 @@ QDF_STATUS send_roam_scan_filter_cmd_tlv(wmi_unified_t wmi_handle,
 	wmi_roam_lca_disallow_config_tlv_param *blist_param;
 
 	len = sizeof(wmi_roam_filter_fixed_param);
+
 	len += WMI_TLV_HDR_SIZE;
-	len += roam_req->len;
+	if (roam_req->num_bssid_black_list)
+		len += roam_req->num_bssid_black_list * sizeof(wmi_mac_addr);
+	len += WMI_TLV_HDR_SIZE;
+	if (roam_req->num_ssid_white_list)
+		len += roam_req->num_ssid_white_list * sizeof(wmi_ssid);
+	len += 2 * WMI_TLV_HDR_SIZE;
+	if (roam_req->num_bssid_preferred_list) {
+		len += roam_req->num_bssid_preferred_list * sizeof(wmi_mac_addr);
+		len += roam_req->num_bssid_preferred_list * sizeof(A_UINT32);
+	}
+	if (roam_req->lca_disallow_config_present)
+		len += WMI_TLV_HDR_SIZE +
+			sizeof(wmi_roam_lca_disallow_config_tlv_param);
 
 	buf = wmi_buf_alloc(wmi_handle, len);
 	if (!buf) {
@@ -5073,7 +5146,9 @@ QDF_STATUS send_roam_scan_filter_cmd_tlv(wmi_unified_t wmi_handle,
 		blist_param->rssi_channel_penalization =
 				roam_req->rssi_channel_penalization;
 		blist_param->num_disallowed_aps = roam_req->num_disallowed_aps;
-		blist_param->disallow_lca_enable_source_bitmap = 0x1;
+		blist_param->disallow_lca_enable_source_bitmap =
+			(WMI_ROAM_LCA_DISALLOW_SOURCE_PER |
+			WMI_ROAM_LCA_DISALLOW_SOURCE_BACKGROUND);
 		buf_ptr += (sizeof(wmi_roam_lca_disallow_config_tlv_param));
 	}
 
@@ -8443,6 +8518,82 @@ QDF_STATUS send_add_clear_mcbc_filter_cmd_tlv(wmi_unified_t wmi_handle,
 }
 
 /**
+ * send_multiple_add_clear_mcbc_filter_cmd_tlv() - send multiple  mcast filter
+ *						   command to fw
+ * @wmi_handle: wmi handle
+ * @vdev_id: vdev id
+ * @mcast_filter_params: mcast filter params
+ *
+ * Return: QDF_STATUS_SUCCESS for success or error code
+ */
+QDF_STATUS send_multiple_add_clear_mcbc_filter_cmd_tlv(wmi_unified_t wmi_handle,
+				     uint8_t vdev_id,
+				     struct mcast_filter_params *filter_param)
+
+{
+	WMI_SET_MULTIPLE_MCAST_FILTER_CMD_fixed_param *cmd;
+	uint8_t *buf_ptr;
+	wmi_buf_t buf;
+	int err;
+	int i;
+	uint8_t *mac_addr_src_ptr = NULL;
+	wmi_mac_addr *mac_addr_dst_ptr;
+	uint32_t len = sizeof(*cmd) + WMI_TLV_HDR_SIZE +
+		sizeof(wmi_mac_addr) * filter_param->multicast_addr_cnt;
+
+	buf = wmi_buf_alloc(wmi_handle, len);
+	if (!buf) {
+		WMI_LOGE("Failed to allocate memory");
+		return QDF_STATUS_E_NOMEM;
+	}
+
+	buf_ptr = (A_UINT8 *) wmi_buf_data(buf);
+	cmd = (WMI_SET_MULTIPLE_MCAST_FILTER_CMD_fixed_param *)
+		wmi_buf_data(buf);
+	qdf_mem_zero(cmd, sizeof(*cmd));
+
+	WMITLV_SET_HDR(&cmd->tlv_header,
+	       WMITLV_TAG_STRUC_wmi_set_multiple_mcast_filter_cmd_fixed_param,
+	       WMITLV_GET_STRUCT_TLVLEN
+	       (WMI_SET_MULTIPLE_MCAST_FILTER_CMD_fixed_param));
+	cmd->operation =
+		((filter_param->action == 0) ? WMI_MULTIPLE_MCAST_FILTER_DELETE
+					: WMI_MULTIPLE_MCAST_FILTER_ADD);
+	cmd->vdev_id = vdev_id;
+	cmd->num_mcastaddrs = filter_param->multicast_addr_cnt;
+
+	buf_ptr += sizeof(*cmd);
+	WMITLV_SET_HDR(buf_ptr, WMITLV_TAG_ARRAY_FIXED_STRUC,
+		       sizeof(wmi_mac_addr) *
+			       filter_param->multicast_addr_cnt);
+
+	if (filter_param->multicast_addr_cnt == 0)
+		goto send_cmd;
+
+	mac_addr_src_ptr = (uint8_t *)&filter_param->multicast_addr;
+	mac_addr_dst_ptr = (wmi_mac_addr *)
+			(buf_ptr + WMI_TLV_HDR_SIZE);
+
+	for (i = 0; i < filter_param->multicast_addr_cnt; i++) {
+		WMI_CHAR_ARRAY_TO_MAC_ADDR(mac_addr_src_ptr, mac_addr_dst_ptr);
+		mac_addr_src_ptr += ATH_MAC_LEN;
+		mac_addr_dst_ptr++;
+	}
+
+send_cmd:
+	err = wmi_unified_cmd_send(wmi_handle, buf,
+				   len,
+				   WMI_SET_MULTIPLE_MCAST_FILTER_CMDID);
+	if (err) {
+		WMI_LOGE("Failed to send set_param cmd");
+		wmi_buf_free(buf);
+		return QDF_STATUS_E_FAILURE;
+	}
+
+	return QDF_STATUS_SUCCESS;
+}
+
+/**
  * send_gtk_offload_cmd_tlv() - send GTK offload command to fw
  * @wmi_handle: wmi handle
  * @vdev_id: vdev id
@@ -10054,6 +10205,13 @@ QDF_STATUS send_log_supported_evt_cmd_tlv(wmi_unified_t wmi_handle,
 	if (wmi_handle->events_logs_list)
 		qdf_mem_free(wmi_handle->events_logs_list);
 
+	if (num_of_diag_events_logs >
+		(WMI_SVC_MSG_MAX_SIZE / sizeof(uint32_t))) {
+		WMI_LOGE("%s: excess num of logs:%d", __func__,
+			num_of_diag_events_logs);
+		QDF_ASSERT(0);
+		return QDF_STATUS_E_INVAL;
+	}
 	/* Store the event list for run time enable/disable */
 	wmi_handle->events_logs_list = qdf_mem_malloc(num_of_diag_events_logs *
 			sizeof(uint32_t));
@@ -11133,17 +11291,18 @@ error:
  * Return: CDF status
  */
 QDF_STATUS send_roam_scan_offload_ap_profile_cmd_tlv(wmi_unified_t wmi_handle,
-					    wmi_ap_profile *ap_profile_p,
-					    uint32_t vdev_id)
+					   struct ap_profile_params *ap_profile)
 {
 	wmi_buf_t buf = NULL;
 	QDF_STATUS status;
 	int len;
 	uint8_t *buf_ptr;
 	wmi_roam_ap_profile_fixed_param *roam_ap_profile_fp;
+	wmi_roam_cnd_scoring_param *score_param;
+	wmi_ap_profile *profile;
 
 	len = sizeof(wmi_roam_ap_profile_fixed_param) + sizeof(wmi_ap_profile);
-
+	len += sizeof(*score_param);
 	buf = wmi_buf_alloc(wmi_handle, len);
 	if (!buf) {
 		WMI_LOGE("%s : wmi_buf_alloc failed", __func__);
@@ -11157,14 +11316,143 @@ QDF_STATUS send_roam_scan_offload_ap_profile_cmd_tlv(wmi_unified_t wmi_handle,
 		       WMITLV_GET_STRUCT_TLVLEN
 			       (wmi_roam_ap_profile_fixed_param));
 	/* fill in threshold values */
-	roam_ap_profile_fp->vdev_id = vdev_id;
+	roam_ap_profile_fp->vdev_id = ap_profile->vdev_id;
 	roam_ap_profile_fp->id = 0;
 	buf_ptr += sizeof(wmi_roam_ap_profile_fixed_param);
 
-	qdf_mem_copy(buf_ptr, ap_profile_p, sizeof(wmi_ap_profile));
-	WMITLV_SET_HDR(buf_ptr,
+	profile = (wmi_ap_profile *)buf_ptr;
+	WMITLV_SET_HDR(&profile->tlv_header,
 		       WMITLV_TAG_STRUC_wmi_ap_profile,
 		       WMITLV_GET_STRUCT_TLVLEN(wmi_ap_profile));
+	profile->flags = ap_profile->profile.flags;
+	profile->rssi_threshold = ap_profile->profile.rssi_threshold;
+	profile->ssid.ssid_len = ap_profile->profile.ssid.length;
+	qdf_mem_copy(profile->ssid.ssid, ap_profile->profile.ssid.mac_ssid,
+		     profile->ssid.ssid_len);
+	profile->rsn_authmode = ap_profile->profile.rsn_authmode;
+	profile->rsn_ucastcipherset = ap_profile->profile.rsn_ucastcipherset;
+	profile->rsn_mcastcipherset = ap_profile->profile.rsn_mcastcipherset;
+	profile->rsn_mcastmgmtcipherset =
+				ap_profile->profile.rsn_mcastmgmtcipherset;
+	profile->rssi_abs_thresh = ap_profile->profile.rssi_abs_thresh;
+
+	WMI_LOGD("AP profile: flags %x rssi_threshold %d ssid:%.*s authmode %d uc cipher %d mc cipher %d mc mgmt cipher %d rssi abs thresh %d",
+		 profile->flags, profile->rssi_threshold,
+		 profile->ssid.ssid_len, ap_profile->profile.ssid.mac_ssid,
+		 profile->rsn_authmode, profile->rsn_ucastcipherset,
+		 profile->rsn_mcastcipherset, profile->rsn_mcastmgmtcipherset,
+		 profile->rssi_abs_thresh);
+
+	buf_ptr += sizeof(wmi_ap_profile);
+
+	score_param = (wmi_roam_cnd_scoring_param *)buf_ptr;
+	WMITLV_SET_HDR(&score_param->tlv_header,
+		       WMITLV_TAG_STRUC_wmi_roam_cnd_scoring_param,
+		       WMITLV_GET_STRUCT_TLVLEN(wmi_roam_cnd_scoring_param));
+	score_param->disable_bitmap = ap_profile->param.disable_bitmap;
+	score_param->rssi_weightage_pcnt =
+			ap_profile->param.rssi_weightage;
+	score_param->ht_weightage_pcnt = ap_profile->param.ht_weightage;
+	score_param->vht_weightage_pcnt = ap_profile->param.vht_weightage;
+	score_param->he_weightage_pcnt = ap_profile->param.he_weightage;
+	score_param->bw_weightage_pcnt = ap_profile->param.bw_weightage;
+	score_param->band_weightage_pcnt = ap_profile->param.band_weightage;
+	score_param->nss_weightage_pcnt = ap_profile->param.nss_weightage;
+	score_param->esp_qbss_weightage_pcnt =
+			ap_profile->param.esp_qbss_weightage;
+	score_param->beamforming_weightage_pcnt =
+			ap_profile->param.beamforming_weightage;
+	score_param->pcl_weightage_pcnt = ap_profile->param.pcl_weightage;
+	score_param->oce_wan_weightage_pcnt =
+			ap_profile->param.oce_wan_weightage;
+
+	WMI_LOGD("Score params weightage: disable_bitmap %x rssi %d ht %d vht %d he %d BW %d band %d NSS %d ESP %d BF %d PCL %d OCE WAN %d",
+		 score_param->disable_bitmap, score_param->rssi_weightage_pcnt,
+		 score_param->ht_weightage_pcnt,
+		 score_param->vht_weightage_pcnt,
+		 score_param->he_weightage_pcnt, score_param->bw_weightage_pcnt,
+		 score_param->band_weightage_pcnt,
+		 score_param->nss_weightage_pcnt,
+		 score_param->esp_qbss_weightage_pcnt,
+		 score_param->beamforming_weightage_pcnt,
+		 score_param->pcl_weightage_pcnt,
+		 score_param->oce_wan_weightage_pcnt);
+
+	score_param->bw_scoring.score_pcnt = ap_profile->param.bw_index_score;
+	score_param->band_scoring.score_pcnt =
+			ap_profile->param.band_index_score;
+	score_param->nss_scoring.score_pcnt =
+			ap_profile->param.nss_index_score;
+
+	WMI_LOGD("Params index score bitmask: bw_index_score %x band_index_score %x nss_index_score %x",
+		 score_param->bw_scoring.score_pcnt,
+		 score_param->band_scoring.score_pcnt,
+		 score_param->nss_scoring.score_pcnt);
+
+	score_param->rssi_scoring.best_rssi_threshold =
+		(-1) * ap_profile->param.rssi_scoring.best_rssi_threshold;
+	score_param->rssi_scoring.good_rssi_threshold =
+		(-1) * ap_profile->param.rssi_scoring.good_rssi_threshold;
+	score_param->rssi_scoring.bad_rssi_threshold =
+		(-1) * ap_profile->param.rssi_scoring.bad_rssi_threshold;
+	score_param->rssi_scoring.good_rssi_pcnt =
+		ap_profile->param.rssi_scoring.good_rssi_pcnt;
+	score_param->rssi_scoring.bad_rssi_pcnt =
+		ap_profile->param.rssi_scoring.bad_rssi_pcnt;
+	score_param->rssi_scoring.good_bucket_size =
+		ap_profile->param.rssi_scoring.good_bucket_size;
+	score_param->rssi_scoring.bad_bucket_size =
+		ap_profile->param.rssi_scoring.bad_bucket_size;
+	score_param->rssi_scoring.rssi_pref_5g_rssi_thresh =
+		(-1) * ap_profile->param.rssi_scoring.rssi_pref_5g_rssi_thresh;
+
+	WMI_LOGD("Rssi scoring threshold: best RSSI %d good RSSI %d bad RSSI %d prefer 5g threshold %d",
+		 score_param->rssi_scoring.best_rssi_threshold,
+		 score_param->rssi_scoring.good_rssi_threshold,
+		 score_param->rssi_scoring.bad_rssi_threshold,
+		 score_param->rssi_scoring.rssi_pref_5g_rssi_thresh);
+	WMI_LOGD("Good RSSI score for each slot %d bad RSSI score for each slot %d good bucket %d bad bucket %d",
+		 score_param->rssi_scoring.good_rssi_pcnt,
+		 score_param->rssi_scoring.bad_rssi_pcnt,
+		 score_param->rssi_scoring.good_bucket_size,
+		 score_param->rssi_scoring.bad_bucket_size);
+
+	score_param->esp_qbss_scoring.num_slot =
+			ap_profile->param.esp_qbss_scoring.num_slot;
+	score_param->esp_qbss_scoring.score_pcnt3_to_0 =
+			ap_profile->param.esp_qbss_scoring.score_pcnt3_to_0;
+	score_param->esp_qbss_scoring.score_pcnt7_to_4 =
+			ap_profile->param.esp_qbss_scoring.score_pcnt7_to_4;
+	score_param->esp_qbss_scoring.score_pcnt11_to_8 =
+			ap_profile->param.esp_qbss_scoring.score_pcnt11_to_8;
+	score_param->esp_qbss_scoring.score_pcnt15_to_12 =
+			ap_profile->param.esp_qbss_scoring.score_pcnt15_to_12;
+
+	WMI_LOGD("ESP QBSS index weight: slots %d weight 0to3 %x weight 4to7 %x weight 8to11 %x weight 12to15 %x",
+		 score_param->esp_qbss_scoring.num_slot,
+		 score_param->esp_qbss_scoring.score_pcnt3_to_0,
+		 score_param->esp_qbss_scoring.score_pcnt7_to_4,
+		 score_param->esp_qbss_scoring.score_pcnt11_to_8,
+		 score_param->esp_qbss_scoring.score_pcnt15_to_12);
+
+	score_param->oce_wan_scoring.num_slot =
+			ap_profile->param.oce_wan_scoring.num_slot;
+	score_param->oce_wan_scoring.score_pcnt3_to_0 =
+			ap_profile->param.oce_wan_scoring.score_pcnt3_to_0;
+	score_param->oce_wan_scoring.score_pcnt7_to_4 =
+			ap_profile->param.oce_wan_scoring.score_pcnt7_to_4;
+	score_param->oce_wan_scoring.score_pcnt11_to_8 =
+			ap_profile->param.oce_wan_scoring.score_pcnt11_to_8;
+	score_param->oce_wan_scoring.score_pcnt15_to_12 =
+			ap_profile->param.oce_wan_scoring.score_pcnt15_to_12;
+
+	WMI_LOGD("OCE WAN index weight: slots %d weight 0to3 %x weight 4to7 %x weight 8to11 %x weight 12to15 %x",
+		 score_param->oce_wan_scoring.num_slot,
+		 score_param->oce_wan_scoring.score_pcnt3_to_0,
+		 score_param->oce_wan_scoring.score_pcnt7_to_4,
+		 score_param->oce_wan_scoring.score_pcnt11_to_8,
+		 score_param->oce_wan_scoring.score_pcnt15_to_12);
+
 	status = wmi_unified_cmd_send(wmi_handle, buf,
 				      len, WMI_ROAM_AP_PROFILE);
 	if (QDF_IS_STATUS_ERROR(status)) {
@@ -13340,6 +13628,8 @@ struct wmi_ops tlv_ops =  {
 		send_enable_disable_packet_filter_cmd_tlv,
 	.send_config_packet_filter_cmd = send_config_packet_filter_cmd_tlv,
 	.send_add_clear_mcbc_filter_cmd = send_add_clear_mcbc_filter_cmd_tlv,
+	.send_multiple_add_clear_mcbc_filter_cmd =
+		send_multiple_add_clear_mcbc_filter_cmd_tlv,
 	.send_gtk_offload_cmd = send_gtk_offload_cmd_tlv,
 	.send_process_gtk_offload_getinfo_cmd =
 			send_process_gtk_offload_getinfo_cmd_tlv,
