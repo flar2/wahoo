@@ -238,14 +238,12 @@ void disp_err_recovery_work(struct work_struct *work)
 
 irqreturn_t disp_err_detect_handler(int irq, void *data)
 {
-#if 0
 	struct mdss_dsi_ctrl_pdata *pdata = (struct mdss_dsi_ctrl_pdata *)data;
 
 	pr_info("%s: Handle disp ERR_DETECT\n", __func__);
 	if (pdata->rdy_err_detect)
 		schedule_delayed_work(&pdata->err_int_work,
 			msecs_to_jiffies(DISP_ERR_RECOVERY_MS));
-#endif
 	return IRQ_HANDLED;
 }
 
