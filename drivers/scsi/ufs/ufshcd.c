@@ -1588,6 +1588,11 @@ start:
 		 */
 		if (ufshcd_can_hibern8_during_gating(hba) &&
 		    ufshcd_is_link_hibern8(hba)) {
+			if (async) {
+				rc = -EAGAIN;
+				hba->clk_gating.active_reqs--;
+				break;
+			}
 			spin_unlock_irqrestore(hba->host->host_lock, flags);
 			flush_work(&hba->clk_gating.ungate_work);
 			spin_lock_irqsave(hba->host->host_lock, flags);
@@ -6214,10 +6219,6 @@ static void ufshcd_err_handler(struct work_struct *work)
 	if (hba->h8_err) {
 		dev_err(hba->dev, "%s: saved_err 0x%x saved_uic_err 0x%x",
 			__func__, hba->saved_err, hba->saved_uic_err);
-		ufshcd_print_host_regs(hba);
-		ufshcd_print_cmd_log(hba);
-		ufshcd_print_host_state(hba);
-		ufshcd_print_pwr_info(hba);
 		ufshcd_print_phy_state(hba);
 		hba->h8_err = false;
 		hba->silence_err_logs = true;
