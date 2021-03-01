@@ -22,7 +22,6 @@
 #include <linux/qpnp/qpnp-adc.h>
 #include <linux/reboot.h>
 #include <linux/rtc.h>
-#include <linux/wahoo_info.h>
 #include <linux/wakelock.h>
 #include <linux/workqueue.h>
 
@@ -1120,9 +1119,6 @@ static struct platform_driver htc_battery_driver = {
 static int __init htc_battery_init(void)
 {
 	int ret;
-
-	if (!is_google_walleye())
-		return -ENODEV;
 
 	wake_lock_init(&htc_batt_info.charger_exist_lock,
 		       WAKE_LOCK_SUSPEND, "charger_exist_lock");
